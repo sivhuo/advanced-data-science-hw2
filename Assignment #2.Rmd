@@ -1,0 +1,335 @@
+---
+title: 'Assignment #2'
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    df_print: paged
+    code_download: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message=FALSE, warning=FALSE)
+```
+
+```{r libraries}
+library(tidyverse)         # for graphing and data cleaning
+library(tidymodels)        # for modeling
+library(naniar)            # for analyzing missing values
+library(vip)               # for variable importance plots
+library(usemodels)         # for suggesting step_XXX() functions
+library(glmnet)            # for regularized regression, including LASSO 
+library(lubridate)         # for date manipulation
+library(moderndive)        # for King County housing data
+library(rmarkdown)         # for paged tables
+library(stacks)
+library(doParallel)        # for parallel processing
+library(tidyr)
+library(rsample)
+library(forcats)
+library(parsnip)
+```
+
+```{r}
+theme_set(theme_minimal()) # Lisa's favorite theme
+```
+
+```{r data}
+hotels <- readr::read_csv('https://raw.githubusercontent.com/rfordatascience/tidytuesday/master/data/2020/2020-02-11/hotels.csv')
+```
+
+## GitHub 
+
+https://github.com/sivhuo/advanced-data-science-hw2
+
+## Machine Learning review and intro to tidymodels 
+
+Read through and follow along with the Machine Learning review with an intro to the tidymodels package posted on the Course Materials page.
+
+### Tasks:
+
+1. Read about the hotel booking data, hotels, on the Tidy Tuesday page it came from. There is also a link to an article from the original authors. The outcome we will be predicting is called is_canceled.
+  - Without doing any analysis, what are some variables you think might be predictive and why?
+      - What are some problems that might exist with the data? You might think about how it was collected and who did the collecting.
+
+Without doing any analysis, the variables I think that might be predictive are lead_time, previous_cancellation, and previous_bookings_not_canceled. The longer the lead_time is, the higher the chance that customers would want to change their plan and cancel the booking. The previous cancellation shows us the the number of previous bookings that were cancelled by the customer prior to the current booking, which could be used to determine customer's behaviors and decision for the current booking. This can also be applied to previous_booking_not canceled. 
+
+Since the data was retrieved directly from the hotel database, the hotels' workers were the ones who collected the data. With this information, it is possible that the data could be manipulated or biased based on the view of the hotels' workers. 
+
+  - If we construct a model, what type of conclusions will be able to draw from it?
+
+If we construct a model, we will be able to see which variables have the highest impact on the decision of cancelling a booking. 
+
+2. Create some exploratory plots or table summaries of the variables in the dataset. Be sure to also examine missing values or other interesting values. You may want to adjust the fig.width and fig.height in the code chunk options.
+
+The hotel dataset has 32 variables in total. The variable that we will predict is "is_canceled". It can be 0 (the booking is not canceled), or 1 (the booking is canceled). 
+
+We are going to look at the distribution of all variables in the dataset to see if there is anything irregular. 
+
+```{r}
+hotels %>% 
+  select(where(is.numeric)) %>% 
+  pivot_longer(cols = everything(),
+               names_to = "variable", 
+               values_to = "value") %>% 
+  ggplot(aes(x = value)) +
+  geom_histogram(bins = 30) +
+  facet_wrap(vars(variable), 
+             scales = "free")
+
+```
+
+There are a couple of things we notice in the graphs above. 
+
+  - There is a right skewness in `lead_time` and `stay_in_week_nights` distribution. With these kind of variables, we can use log transform if we use linear regression method.
+  
+  - Many variables such as `adr`, `babies`, `children`, `days_in_waiting_list`, `required_car_parking_space` contains 0 for most of its data point. With these variables, we can create indicative variables of having that feature or not. For example, a variable called `children` where a `0` indicates no basement (children = 0), and `1` indicates a basement (children > 0).
+  
+  - The number of cancelled bookings is quite close to the number of bookings not being canceled. With these number of data points, we can do any machine learning models on it. 
+
+3. First, we will do a couple things to get the data ready.
+
+  - I did the following for you: made outcome a factor (needs to be that way for logistic regression), made all character variables factoors, removed the year variable and some reservation status variables, and removed cases with missing values (not NULLs but true missing values).
+
+  - You need to split the data into a training and test set, stratifying on the outcome variable, is_canceled. Since we have a lot of data, split the data 50/50 between training and test. I have already set.seed() for you. Be sure to use hotels_mod in the splitting.
+
+```{r}
+hotels_mod <- hotels %>% 
+  mutate(is_canceled = as.factor(is_canceled)) %>% 
+  mutate(across(where(is.character), as.factor)) %>% 
+  select(-arrival_date_year,
+         -reservation_status,
+         -reservation_status_date) %>% 
+  add_n_miss() %>% 
+  filter(n_miss_all == 0) %>% 
+  select(-n_miss_all)
+```
+
+Splitting the data into training and test set. 
+
+```{r}
+set.seed(494)
+hotels_split <- initial_split(hotels_mod, 
+                             prop = .5)
+hotels_split
+```
+
+```{r}
+hotels_training <- training(hotels_split)
+hotels_testing <- testing(hotels_split)
+```
+
+4. In this next step, we are going to do the pre-processing. Usually, I won’t tell you exactly what to do here, but for your first exercise, I’ll tell you the steps.
+
+  - Set up the recipe with `is_canceled` as the outcome and all other variables as predictors (HINT: ~.).
+  - Use a `step_XXX()` function or functions (I think there are other ways to do this, but I found step_mutate_at() easiest) to create some indicator variables for the following variables: children, babies, and previous_cancellations. So, the new variable should be a 1 if the original is more than 0 and 0 otherwise. Make sure you do this in a way that accounts for values that may be larger than any we see in the dataset.
+  - For the `agent` and `company` variables, make new indicator variables that are 1 if they have a value of `NULL` and 0 otherwise. I also used `step_mutate_at()` for this, but there’s more ways you could do it.
+  - Use `fct_lump_n()` inside `step_mutate()` to lump together countries that aren’t in the top 5 most occurring.
+  - If you used new names for some of the new variables you created, then remove any variables that are no longer needed.
+  - Use `step_normalize()` to center and scale all the non-categorical predictor variables. (Do this BEFORE creating dummy variables. When I tried to do it after, I ran into an error - I’m still investigating why.)
+  - Create dummy variables for all factors/categorical predictor variables (make sure you have `-all_outcomes()` in this part!!).
+  - Use the `prep()` and `juice()` functions to apply the steps to the training data just to check that everything went as planned.
+  
+```{r}
+hotel_recipe <- recipe(is_canceled ~ .,
+                       data = hotels_training) %>% 
+  step_mutate_at(children, babies, previous_cancellations,
+                 fn = ~ as.numeric(. > 0)) %>%
+  step_mutate_at(agent, company,
+                 fn = ~ as.numeric(. == "NULL")) %>%
+  step_mutate(country, 
+              country_group = fct_lump_n(country, n = 5)) %>% 
+  step_rm(country) %>% 
+  step_normalize(all_predictors(),
+                 -all_nominal(),
+                 -all_outcomes()) %>%
+  step_dummy(all_nominal(),
+             -all_outcomes())
+
+```
+  
+```{r}
+hotel_recipe %>% 
+  prep(hotels_training) %>%
+  juice() 
+```
+5. In this step we will set up a LASSO model and workflow.
+
+  - In general, why would we want to use LASSO instead of regular logistic regression? (HINT: think about what happens to the coefficients).
+  - Lasso regularizations are also known as ‘shrinkage’ methods, because they reduce or shrink the coefficients in the resulting regression. This reduces the variance in the model: as input variables are changed, the model’s prediction changes less than it would have without the regularization. While using LASSO model, we can avoid overfit by reducing the variance of a model.
+  - Meanwhile, logistic regression does not shrink the variables, so we will have a lot of variables than needed.
+  - Define the model type, set the engine, set the penalty argument to tune() as a placeholder, and set the mode.
+  - Create a workflow with the recipe and model.
+  
+```{r}
+hotel_lasso_mod <- 
+  logistic_reg(mixture = 1) %>% 
+  set_engine("glmnet") %>% 
+  set_args(penalty = tune()) %>% 
+  set_mode("classification")
+```
+
+```{r}
+hotel_lasso_wf <- 
+  workflow() %>% 
+  add_recipe(hotel_recipe) %>%
+  add_model(hotel_lasso_mod)
+
+hotel_lasso_wf
+```
+
+6. In this step, we’ll tune the model and fit the model using the best tuning parameter to the entire training dataset.
+
+  - Create a 5-fold cross-validation sample. We’ll use this later. I have set the seed for you.
+  - Use the `grid_regular()` function to create a grid of 10 potential penalty parameters (we’re keeping this sort of small because the dataset is pretty large). Use that with the 5-fold cv data to tune the model.
+  - Use the `tune_grid()` function to fit the models with different tuning parameters to the different cross-validation sets.
+  - Use the `collect_metrics()` function to collect all the metrics from the previous step and create a plot with the accuracy on the y-axis and the penalty term on the x-axis. Put the x-axis on the log scale.
+  - Use the `select_best()` function to find the best tuning parameter, fit the model using that tuning parameter to the entire training set (HINT: `finalize_workflow()` and `fit()`), and display the model results using `pull_workflow_fit()` and `tidy()`. Are there some variables with coefficients of 0?
+  
+```{r}
+hotel_cv <- vfold_cv(hotels_training, v = 5)
+penalty_grid <- grid_regular(penalty(),
+                             levels = 10)
+
+hotel_lasso_tune <- 
+  hotel_lasso_wf %>% 
+  tune_grid(
+    resamples = hotel_cv,
+    grid = penalty_grid
+  )
+
+```
+
+```{r}
+collect_metrics(hotel_lasso_tune, summarize = TRUE)
+```
+```{r}
+collect_metrics(hotel_lasso_tune) %>%  
+  filter(.metric == "accuracy") %>% 
+  ggplot(aes(x = log(penalty), y = mean)) + geom_point()
+```
+```{r}
+hotel_lasso_tune %>% 
+  show_best(metric = "accuracy")
+```
+
+```{r}
+best_tuning_param <- hotel_lasso_tune %>% 
+  select_best(metric = "accuracy")
+best_tuning_param
+```
+```{r}
+hotel_lasso_final_wf <- hotel_lasso_wf %>% 
+  finalize_workflow(best_tuning_param)
+hotel_lasso_final_wf
+```
+
+```{r}
+hotel_lasso_final_mod <- hotel_lasso_final_wf %>% 
+  fit(data = hotels_training)
+
+hotel_lasso_final_mod %>% 
+  pull_workflow_fit() %>% 
+  tidy() 
+```
+
+From the result table above, we can see that some variables such as `arrival_date_month_September`, `market_segment_Undefined`, `distribution_channel_Undefined` have `0` coefficients, meaning that they have no impact on the decision of bookings being canceled. 
+
+7. Now that we have a model, let’s evaluate it a bit more. All we have looked at so far is the cross-validated accuracy from the previous step.
+  - Create a variable importance graph. Which variables show up as the most important? Are you surprised?
+  
+```{r}
+hotel_lasso_final_mod %>% 
+  pull_workflow_fit() %>% 
+  vip()
+```
+
+It shows that `reserved_room_type_P`, `assigned_room_type_I`, and `deposit_type_Non.Refund` are the top three important variables. I am surprised by this result. I didn't expect to see the room types could actually make a big impact on the `is_canceled` variable. It is also interesting that `previous_cancellation` variable didn't make up to the list above. 
+  
+  - Use the `last_fit()` function to fit the final model and then apply it to the testing data. Report the metrics from the testing data using the `collect_metrics()` function. How do they compare to the cross-validated metrics?
+  
+```{r}
+hotel_lasso_test <- hotel_lasso_final_wf %>% 
+  last_fit(hotels_split)
+
+hotel_lasso_test %>% 
+  collect_metrics()
+```
+
+```{r}
+collect_metrics(hotel_lasso_tune) %>%
+  filter(.metric == 'accuracy')
+```
+
+From the two tables above, we can see that the testing data's accuracy is pretty similar to the training data's accuracy. The testing data's accuracy 0.8138140 is slightly lower than the training data's highest accuracy, 0.8158746. But overall, it is fairly consistent with the testing data's accuracy . 
+  
+  - Use the `collect_predictions()` function to find the predicted probabilities and classes for the test data. Save this to a new dataset called preds. Then, use the `conf_mat()` function from `dials` (part of `tidymodels`) to create a confusion matrix showing the predicted classes vs. the true classes. Compute the true positive rate (sensitivity), true negative rate (specificity), and accuracy. See this Wikipedia reference if you (like me) tend to forget these definitions. Also keep in mind that a “positive” in this case is a cancellation (those are the 1’s).
+  
+```{r}
+preds <- collect_predictions(hotel_lasso_test)
+preds
+```
+  
+```{r}
+preds %>%
+  conf_mat(truth = is_canceled, estimate = .pred_class)
+```
+
+True positive rate is 14358/(7734 + 14358) = 0.6499
+True negative rate is 34221/(34221 + 3380) = 0.9101
+Accuracy = (34221 + 14358)/(34221 + 3380 + 7734 + 14358) = 0.8138 
+
+  - Use the `preds` dataset you just created to create a density plot of the predicted probabilities of canceling (the variable is called `.pred_1`), filling by `is_canceled`. Use an `alpha = .5` and `color = NA` in the `geom_density()`. Answer these questions:
+  
+```{r}
+preds %>%
+  ggplot(aes(x = .pred_1, fill = is_canceled)) + geom_density(alpha = 0.5, color = NA)
+```
+  
+  a. What would this graph look like for a model with an accuracy that was close to 1?
+  
+For a model with an accuracy that was close to 1, we would see the distribution density of is_canceled = 0 skews to the left close to zero value, and the distribution density of is_calceled = 1 skews to the right close to 1. There wouldn't be that much density in the middle part of the graph. 
+  
+  b. Our predictions are classified as canceled if their predicted probability of canceling is greater than .5. If we wanted to have a high true positive rate, should we make the cutoff for predicted as canceled higher or lower than .5?
+
+If we want to make a high true positive rate, we should make the cutoff for predicted as canceled lower than .5. 
+  
+  c. What happens to the true negative rate if we try to get a higher true positive rate?
+
+If we try to get a higher true positive rate, the true negative rate will be lower. 
+  
+8. Let’s say that this model is going to be applied to bookings 14 days in advance of their arrival at each hotel, and someone who works for the hotel will make a phone call to the person who made the booking. During this phone call, they will try to assure that the person will be keeping their reservation or that they will be canceling in which case they can do that now and still have time to fill the room. How should the hotel go about deciding who to call? How could they measure whether it was worth the effort to do the calling? Can you think of another way they might use the model?
+
+Based on the variable importance graph, the hotels should call people who mostly cancel the bookings. The two major groups they should call are the ones who reserved room type P, or have non-refundable bookings. These groups of people are most likely to cancel their bookings so it is worth calling them. 
+
+They could measure whether it was worth the effort to do the calling based on the rate of the room being canceled as well as how likely that would happen. They can combine their prior knowledge about their customers and demographic with the predicted results obtained from the model to make a decision who to call. 
+
+Another way that we can use this model is to look at which variables that significantly lead to the highest number of rooms being cancelled and use that knowledge to make changes in the hotel accordingly. For example, from the variable importance graph, people who reserve room type P tends to cancel the bookings, the hotel can look more into why and what should be changed to that room type. 
+
+9. How might you go about questioning and evaluating the model in terms of fairness? Are there any questions you would like to ask of the people who collected the data?
+
+In term of fairness, I would question and evaluate the data we used to create this model since it was collected from the hotels directly. It is possible that it might be manipulated or biased towards one side. I would like ask more about how the data is collected, and check if there are any variables that are not included in the dataset due to the hotel confidentiality.
+
+## Bias and Fairness 
+
+Read Chapter 1: The Power Chapter of Data Feminism by Catherine D’Ignazio and Lauren Klein. Write a 4-6 sentence paragraph reflecting on this chapter. As you reflect, you might consider responding to these specific questions. We will also have a discussion about these questions in class on Thursday.
+
+  - At the end of the “Matrix of Domination” section, they encourage us to “ask uncomfortable questions: who is doing the work of data science (and who is not)? Whose goals are prioritized in data science (and whose are not)? And who benefits from data science (and who is either overlooked or actively harmed)?” In general, how would you answer these questions? And why are they important?
+  
+  - Can you think of any examples of missing datasets, like those described in the “Data Science for Whom?” section? Or was there an example there that surprised you?
+  
+  - How did the examples in the “Data Science with Whose Interests and Goals?” section make you feel? What responsibility do companies have to prevent these things from occurring? Who is to blame?
+  
+After reading the 'Matrix of Domination' section, I feel that the data collection process plays an important role in data science. Most of the time, we focus more on the data analysis and conclusion, and forget to question about who and how they gather the data. The data collection should be done as fair as possible and avoid any bias due to who are being prioritized or benefited from data science. 
+  
+In my country, most the data collections are gathered by the government and they tend to be biased towards the government side by covering the part that potentially hurts the government. For example, the education system is not that good in my country, so most of the data collected in this sector would be manipulated to benefit the government. 
+
+After reading that section, I feel that more people should be aware of this bias issue and acknowledge that it exists everywhere in the world. The best we can do is to prevent it as much as possible. The companies should take action in reducing bias in all part of data science and make it as fair as possible to all parties involved. 
+
+  
+  
+  
+
+
+
+
